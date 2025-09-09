@@ -1,0 +1,142 @@
+function Get-UserLogonsFromDCs {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$User,                        # samAccountName、domain\user 或 UPN 都可
+
+        [int]$Days = 7,                       # 时间范围（近 N 天）
+        [string]$ExportCsv,                   # 指定则导出 CSV
+        [string[]]$DomainControllers,         # 不传则自动发现所有 DC
+        [switch]$IncludeFailures,             # 包含失败事件（4625, 4771, 4776(失败)）
+        [PSCredential]$Credential,            # 可选凭据（跨域/无委派时）
+        [switch]$IncludeComputerAccounts      # 默认排除以 $ 结尾的计算机账户
+    )
+
+    # --- 解析用户名（统一成 samAccountName 部分做匹配） ---
+    $userPart = if ($User -match '\\') { $User.Split('\')[-1] }
+                elseif ($User -match '@') { $User.Split('@')[0] }
+                else { $User }
+    $userRegex = "^(?i)$([regex]::Escape($userPart))$"
+
+    # --- 发现所有 DC ---
+    if (-not $DomainControllers) {
+        try { $DomainControllers = (Get-ADDomainController -Filter * | Select-Object -ExpandProperty HostName) }
+        catch { throw "无法获取域控制器列表：$($_.Exception.Message)。请安装 RSAT 或手动传入 -DomainControllers。" }
+    }
+
+    # --- 要抓取的事件 ID（DC 上的认证事件 + 常见登录事件） ---
+    $eventIds = @(4624, 4768, 4769, 4776)     # 成功事件：登录成功、Kerberos(TGT/Service)、NTLM 验证
+    if ($IncludeFailures) { $eventIds += 4625, 4771 }  # 失败：登录失败、Kerberos 预验证失败
+
+    $startTime = (Get-Date).AddDays(-$Days)
+    $out = New-Object System.Collections.Generic.List[object]
+
+    function Get-KV { param($event)
+        $xml = [xml]$event.ToXml()
+        $kv = @{}
+        $xml.Event.EventData.Data | ForEach-Object { $kv[$_.Name] = $_.'#text' }
+        return $kv
+    }
+    function Get-First { param($kv, [string[]]$names)
+        foreach($n in $names){ if($kv.ContainsKey($n) -and $kv[$n]){ return $kv[$n] } }
+        return $null
+    }
+
+    foreach ($dc in $DomainControllers) {
+        Write-Host "[*] Querying $dc ..."
+        $fh = @{ LogName='Security'; Id=$eventIds; StartTime=$startTime }
+        try {
+            $events = if ($Credential) {
+                Get-WinEvent -FilterHashtable $fh -ComputerName $dc -Credential $Credential -ErrorAction Stop
+            } else {
+                Get-WinEvent -FilterHashtable $fh -ComputerName $dc -ErrorAction Stop
+            }
+        } catch {
+            Write-Warning "[-] $dc 查询失败：$($_.Exception.Message)"
+            continue
+        }
+
+        foreach ($e in $events) {
+            $kv = Get-KV $e
+
+            # 统一取“用户名”字段（不同事件字段名不同）
+            $candidateUser = Get-First $kv @('TargetUserName','SubjectUserName','AccountName','TargetAccountName','LogonAccount')
+            if (-not $candidateUser) { continue }
+
+            # 过滤机器账户（默认）
+            if (-not $IncludeComputerAccounts -and $candidateUser -match '\$$') { continue }
+
+            # 过滤 DWM/UMFD 等系统会话（极少出现在 DC，但以防万一）
+            if ($candidateUser -match '^(?i)(DWM|UMFD)-') { continue }
+
+            # 匹配目标用户
+            if ($candidateUser -notmatch $userRegex) { continue }
+
+            # 取通用信息
+            $eventId     = $e.Id
+            $time        = $e.TimeCreated
+            $domain      = Get-First $kv @('TargetDomainName','SubjectDomainName','TransmittedServices') # 仅作参考
+            $ip          = Get-First $kv @('IpAddress','ClientAddress')
+            if ($ip -in @('::1','127.0.0.1','::ffff:127.0.0.1','-')) { $ip = $null }
+            $workstation = Get-First $kv @('WorkstationName','ComputerName','ClientName')
+            $logonType   = Get-First $kv @('LogonType')    # 仅 4624/4625 有
+            $statusHex   = Get-First $kv @('Status','FailureReason') # 4776/4625/4771 可能有
+            $authPkg     = Get-First $kv @('AuthenticationPackageName','PackageName')
+            $proc        = Get-First $kv @('ProcessName','LogonProcessName','LmPackageName')
+            $logonId     = Get-First $kv @('TargetLogonId','LogonGuid')
+
+            # 事件语义
+            $kind = switch ($eventId) {
+                4624 { 'Logon Success' }
+                4625 { 'Logon Failure' }
+                4768 { 'Kerberos TGT' }
+                4769 { 'Kerberos Service Ticket' }
+                4771 { 'Kerberos PreAuth Failure' }
+                4776 {
+                    # NTLM 验证：Status=0x0 成功，其它为失败
+                    if ($statusHex -and $statusHex -notmatch '^(?i)0x0$') { 'NTLM Validation Failure' }
+                    else { 'NTLM Validation Success' }
+                }
+                default { "Event $eventId" }
+            }
+
+            # LogonType 文本（仅对 4624/4625 有意义）
+            $logonTypeText = switch ($logonType) {
+                '2'  { 'Interactive' }
+                '3'  { 'Network' }
+                '4'  { 'Batch' }
+                '5'  { 'Service' }
+                '7'  { 'Unlock' }
+                '8'  { 'NetworkCleartext' }
+                '9'  { 'NewCredentials' }
+                '10' { 'RemoteInteractive (RDP)' }
+                '11' { 'CachedInteractive' }
+                default { $null }
+            }
+
+            $out.Add([pscustomobject]@{
+                DC             = $dc
+                TimeCreated    = $time
+                EventId        = $eventId
+                Kind           = $kind
+                User           = $candidateUser
+                Domain         = $domain
+                LogonType      = $logonType
+                LogonTypeText  = $logonTypeText
+                SourceIP       = $ip
+                Workstation    = $workstation
+                AuthPackage    = $authPkg
+                Process        = $proc
+                LogonId        = $logonId
+                StatusRaw      = $statusHex
+            })
+        }
+    }
+
+    $result = $out | Sort-Object TimeCreated
+    if ($ExportCsv) {
+        $result | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $ExportCsv
+        Write-Host "[√] 导出：$ExportCsv"
+    }
+    return $result
+}
