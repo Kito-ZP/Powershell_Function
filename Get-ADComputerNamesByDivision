@@ -1,0 +1,52 @@
+function Get-ADComputerNamesByDivision {
+    param(
+        [string]$outputDirectory = "U:\DivisionComputerList"
+    )
+
+    # Import-Module ActiveDirectory
+
+    # Ensure output directory exists
+    if (-not (Test-Path -Path $outputDirectory)) {
+        New-Item -ItemType Directory -Path $outputDirectory
+    }
+
+    function Export-ComputerList {
+        param(
+            [string]$filePath,
+            [array]$computerList,
+            [switch]$append
+        )
+        if ($append) {
+            $computerList | Sort-Object | Out-File -FilePath $filePath -Append
+        } else {
+            $computerList | Sort-Object | Out-File -FilePath $filePath
+        }
+    }
+
+    # Define the containers to search for each division
+    $containers = @{
+
+
+
+        # "AllComputers" = "OU=AllComputers,DC=ABC,DC=COM"
+    }
+    Out-File -FilePath "$outputDirectory\AllComputers-ComputerList.txt" -Force
+    foreach ($division in $containers.Keys) {
+        $container = $containers[$division]
+        $computers = Get-ADComputer -Filter * -SearchBase $container -Property Name | Select-Object -ExpandProperty Name
+        $filePath = "$outputDirectory\$division-ComputerList.txt"
+        Export-ComputerList -filePath $filePath -computerList $computers
+
+        if ($division -ne "AdminComputers" -and $division -ne "AllComputers") {
+            # Export to AllComputers file as well
+            Export-ComputerList -filePath "$outputDirectory\AllComputers-ComputerList.txt" -computerList $computers -append
+        }
+    }
+
+    # Append AdminComputers to AllComputers
+    $adminComputers = Get-ADComputer -Filter * -SearchBase $containers["AdminComputers"] -Property Name | Select-Object -ExpandProperty Name
+    Export-ComputerList -filePath "$outputDirectory\AllComputers-ComputerList.txt" -computerList $adminComputers -append
+}
+
+# Run the function to get AD computer names and export them
+Get-ADComputerNamesByDivision
