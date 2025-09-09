@@ -1,0 +1,73 @@
+function Install-CiscoJabberRemotely {
+    param (
+        [string]$ComputerListPath,  # Path to the text file containing computer names
+        [string]$InstallerPath,    # Path to the CiscoJabberSetup.msi file
+        [string]$OutputFolder      # Path to save the installation status report
+    )
+
+    # Check if the computer list file exists
+    if (-Not (Test-Path $ComputerListPath)) {
+        Write-Host "The file $ComputerListPath does not exist." -ForegroundColor Red
+        return
+    }
+
+    # Check if the installer file exists
+    if (-Not (Test-Path $InstallerPath)) {
+        Write-Host "The installer file $InstallerPath does not exist." -ForegroundColor Red
+        return
+    }
+
+    # Get the list of computer names
+    $ComputerNames = Get-Content -Path $ComputerListPath
+
+    # Prepare a timestamp for the report file
+    $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $ReportFileName = "CiscoJabberInstallationStatus_$Timestamp.csv"
+    $ReportFilePath = Join-Path -Path $OutputFolder -ChildPath $ReportFileName
+
+    # Initialize an array to hold the report data
+    $ReportData = @()
+
+    foreach ($ComputerName in $ComputerNames) {
+        # Trim any whitespace from the computer name
+        $ComputerName = $ComputerName.Trim()
+
+        Write-Host "Installing Cisco Jabber on $ComputerName..." -ForegroundColor Yellow
+
+        try {
+            # Copy the installer to the remote computer
+            $RemoteInstallerPath = "\\$ComputerName\C$\Temp\CiscoJabberSetup.msi"
+            if (-Not (Test-Path "\\$ComputerName\C$\Temp")) {
+                New-Item -ItemType Directory -Path "\\$ComputerName\C$\Temp" | Out-Null
+            }
+            Copy-Item -Path $InstallerPath -Destination $RemoteInstallerPath -Force
+
+            # Execute the installer on the remote computer with CLEAR=1 parameter
+            $LocalInstallerPath = "C:\Temp\CiscoJabberSetup.msi"
+            Invoke-Command -ComputerName $ComputerName -ScriptBlock {
+                Start-Process "C:\Temp\CiscoJabberSetup.msi" "/q" -Wait
+            }
+
+
+        } catch {
+            Write-Host "Failed to install Cisco Jabber on $ComputerName $_" -ForegroundColor Red
+            $Status = "Error: $_"
+            $Logs = $_.Exception.Message
+        }
+
+        # Add the result and logs to the report
+        $ReportData += [PSCustomObject]@{
+            ComputerName = $ComputerName
+            Status       = $Status
+            Logs         = $Logs
+        }
+    }
+
+    # Export the report to a CSV file
+    $ReportData | Export-Csv -Path $ReportFilePath -NoTypeInformation -Encoding UTF8
+
+    Write-Host "Installation report generated: $ReportFilePath" -ForegroundColor Green
+}
+
+# Example usage:
+# Install-CiscoJabberRemotely -ComputerListPath "C:\Temp\ComputerNames.txt" -InstallerPath "C:\Installers\CiscoJabberSetup.msi" -OutputFolder "C:\Reports"
