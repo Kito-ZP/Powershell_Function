@@ -1,0 +1,71 @@
+function Get-LastBootUpTimeReport {
+    param(
+        [Parameter(Mandatory=$true, ValueFromPipeline=$true)]
+        [string]$FilePath,
+        [Parameter(Mandatory=$false)]
+        [int]$Days = 0
+    )
+
+    # Create an empty array to store the results
+    $results = @()
+    $errors = @()
+
+    # Read the computer names from the text file
+    $computerNames = Get-Content -Path $FilePath
+
+    # Get the date $Days days ago
+    $dateLimit = (Get-Date).AddDays(-$Days)
+
+    foreach ($computerName in $computerNames) {
+        try {
+            Write-Host $computerName
+            # Get the last boot up time from the WMI object
+            $lastBootUpTime = Get-WmiObject -ComputerName $computerName -Class Win32_OperatingSystem -ErrorAction Stop | Select-Object -ExpandProperty LastBootUpTime
+
+            # Convert the last boot up time to a DateTime object
+            $lastBootUpTime = [Management.ManagementDateTimeConverter]::ToDateTime($lastBootUpTime)
+
+            # Check if the last boot up time is earlier than $dateLimit
+            if ($lastBootUpTime -le $dateLimit) {
+                # Add the result to the array
+                $results += New-Object PSObject -Property @{
+                    ComputerName = $computerName
+                    LastBootUpTime = $lastBootUpTime
+                }
+            }
+        }
+        catch {
+            # Log the error message
+            $errors += New-Object PSObject -Property @{
+                ComputerName = $computerName
+                ErrorMessage = $_.Exception.Message
+            }
+        }
+    }
+
+    # Sort the results by LastBootUpTime in descending order
+    $results = $results | Sort-Object LastBootUpTime -Descending
+
+    # Get the current date and time
+    $timestamp = Get-Date -Format 'MM_dd_HH_mm_ss'
+
+    # Choose file name based on whether the 'Days' parameter is used
+    if ($Days -eq 0) {
+        $fileName = "U:\WindowsUpdates\LastBootUpTimeReport\LastBootUpTimeReport_$timestamp.csv"
+        $errorFileName = "U:\WindowsUpdates\LastBootUpTimeReport\ErrorReport_$timestamp.csv"
+    } else {
+        $fileName = "U:\WindowsUpdates\LastBootUpTimeReport\Last${Days}DaysBootUpTimeReport_$timestamp.csv"
+        $errorFileName = "U:\WindowsUpdates\LastBootUpTimeReport\ErrorReport_Last${Days}Days_$timestamp.csv"
+    }
+
+    # Export the results to a CSV file with the timestamp in the file name
+    $results | Export-Csv -Path $fileName -NoTypeInformation
+
+    # If there were any errors, export them to a CSV file
+    if ($errors.Count -gt 0) {
+        $errors | Export-Csv -Path $errorFileName -NoTypeInformation
+    }
+}
+
+#Check-LastBootUpTime -FilePath "U:\DivisionComputerList\AllComputers-ComputerList.txt" -Days 7
+
