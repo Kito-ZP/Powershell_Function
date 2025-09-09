@@ -1,0 +1,52 @@
+function Get-ADUserListByDivision {
+    param(
+        [string]$Division,
+        [string[]]$Divisions,
+        [switch]$All
+    )
+
+    Import-Module ActiveDirectory
+
+    # Directory to save user lists
+    $outputDirectory = "U:\DivisionADUserList"
+    # Ensure output directory exists
+    if (-not (Test-Path -Path $outputDirectory)) {
+        New-Item -ItemType Directory -Path $outputDirectory
+    }
+
+    if ($Division) {
+        $users = Get-ADUser -Filter * -Property DistinguishedName | Where-Object {$_.DistinguishedName -like "*$Division*"}
+        $userNames = $users | ForEach-Object {$_.SamAccountName} | Sort-Object
+        # Write to division-specific file
+        $userNames | Out-File -FilePath "$outputDirectory\$Division-ADUserList.txt"
+    }
+
+    if ($Divisions) {
+        # Clear or Initialize the Multiple Divisions file before starting
+        $multiDivisionsFile = "$outputDirectory\Multiple_Divisions_ADUserList.txt"
+        Remove-Item -Path $multiDivisionsFile -ErrorAction Ignore
+
+        foreach ($Division in $Divisions) {
+            $users = Get-ADUser -Filter * -Property DistinguishedName | Where-Object {$_.DistinguishedName -like "*$Division*"}
+            $userNames = $users | ForEach-Object {$_.SamAccountName} | Sort-Object
+            # Append to Multiple divisions file
+            $userNames | Out-File -FilePath $multiDivisionsFile -Append
+        }
+    }
+
+    if ($All) {
+        # Clear or Initialize the All Divisions file before starting
+        $allDivisionsFile = "$outputDirectory\All_Divisions_ADUserList.txt"
+        Remove-Item -Path $allDivisionsFile -ErrorAction Ignore
+        [string[]]$AllDivisions = ""AdminUsers", "Technology"
+
+        foreach ($Division in $AllDivisions) {
+            $users = Get-ADUser -Filter * -Property DistinguishedName | Where-Object {$_.DistinguishedName -like "*$Division*"}
+            $userNames = $users | ForEach-Object {$_.SamAccountName} | Sort-Object
+            # Write to division-specific file
+            $userNames | Out-File -FilePath "$outputDirectory\$Division-ADUserList.txt"
+            # Append to All divisions file
+            $userNames | Out-File -FilePath $allDivisionsFile -Append
+        }
+    }
+}
