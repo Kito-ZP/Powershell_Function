@@ -1,0 +1,163 @@
+# msu kbupdate
+function Invoke-MSUDeployment {
+    param (
+        [Parameter(Mandatory = $true)][string]$MSUFilePath,
+        [Parameter(Mandatory = $true)][string]$ComputerListPath,
+        [string]$ReportOutputFolder = "\\updatesrv01\d$\WindowsUpdates\KB_Reports"
+    )
+
+    $MSUName = [IO.Path]::GetFileNameWithoutExtension($MSUFilePath)
+    $ExtractedSource = "\\updatesrv01\d$\WindowsUpdates\ExtractMSU\$MSUName"
+    $TimeStamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $ReportPath = Join-Path $ReportOutputFolder "Install-$MSUName-$TimeStamp.csv"
+    $Computers = Get-Content $ComputerListPath
+    $Report = @()
+
+    Extract-MSUWith7ZipRemoteShare -MSUFilePath $MSUFilePath -DestinationFolder $ExtractedSource
+
+    if (-not (Test-MSUExtractFolder -ExtractedPath $ExtractedSource)) {
+        Write-Error "[ERROR] Valid extracted folder not found or is empty: $ExtractedSource"
+        return
+    }
+
+    foreach ($Computer in $Computers) {
+        $Result = Install-MSUToRemote -Computer $Computer -MSUName $MSUName -ExtractedSource $ExtractedSource
+        $Report += $Result
+    }
+
+    $Report | Export-Csv -Path $ReportPath -NoTypeInformation -Encoding UTF8
+    Write-Host "[DONE] Report saved to $ReportPath"
+}
+
+# Function to extract MSU using 7-Zip to shared folder
+function Extract-MSUWith7ZipRemoteShare {
+    param (
+        [string]$MSUFilePath,
+        [string]$DestinationFolder,
+        [string]$SevenZipPath = "C:\Program Files\7-Zip\7z.exe"
+    )
+
+    if (-not (Test-Path $SevenZipPath)) {
+        throw "7z.exe not found at: $SevenZipPath"
+    }
+
+    if ((Test-Path $DestinationFolder) -and (Get-ChildItem $DestinationFolder -Recurse | Where-Object { -not $_.PSIsContainer })) {
+        Write-Host "[SKIP] Extracted folder already exists with content: $DestinationFolder"
+        return
+    }
+
+    Write-Host "[INFO] Extracting MSU to shared folder: $DestinationFolder"
+    New-Item -ItemType Directory -Path $DestinationFolder -Force | Out-Null
+    & "$SevenZipPath" x "`"$MSUFilePath`"" -o"`"$DestinationFolder`"" -y | Out-Null
+    Write-Host "[DONE] Extraction complete."
+}
+
+# Function to check extracted folder
+function Test-MSUExtractFolder {
+    param ([string]$ExtractedPath)
+    if (-not (Test-Path $ExtractedPath)) { return $false }
+    $hasContent = Get-ChildItem -Path $ExtractedPath -Recurse | Where-Object { -not $_.PSIsContainer }
+    return $hasContent.Count -gt 0
+}
+
+# Function to copy files and install on a remote computer
+function Install-MSUToRemote {
+    param (
+        [string]$Computer,
+        [string]$MSUName,
+        [string]$ExtractedSource,
+        [int]$TimeoutSeconds = 600
+    )
+
+    $ExitCodeMap = @{ 
+        0 = "Success"
+        3010 = "Success - Reboot Required"
+        50 = "DISM not applicable"
+        87 = "Invalid parameter"
+        1726 = "RPC Server Unavailable"
+    }
+
+    $Result = [PSCustomObject]@{
+        ComputerName    = $Computer
+        InstallStatus   = ""
+        ExitCode        = ""
+        ExitDescription = ""
+        Error           = ""
+        Skipped         = $false
+    }
+
+    Write-Host "[START] Processing computer: $Computer"
+
+    # Check if remote computer is reachable
+    if (-not (Test-Connection -ComputerName $Computer -Count 1 -Quiet -ErrorAction SilentlyContinue)) {
+        Write-Host "[SKIP] $Computer is unreachable."
+        $Result.InstallStatus = "Skipped"
+        $Result.Skipped = $true
+        return $Result
+    }
+
+    $RemoteFolder = "\\$Computer\c$\Update\MSU\$MSUName"
+    try {
+        if (Test-Path $RemoteFolder) {
+            Remove-Item "$RemoteFolder\*" -Recurse -Force -ErrorAction SilentlyContinue
+        } else {
+            New-Item -Path $RemoteFolder -ItemType Directory -Force | Out-Null
+        }
+
+        Write-Host "[$Computer] Copying files from $ExtractedSource to $RemoteFolder"
+        robocopy $ExtractedSource $RemoteFolder /E /NFL /NDL /NJH /NJS /NP | Out-Null
+
+        $CabFile = Find-CabFile -FolderPath $RemoteFolder
+        if (-not $CabFile) {
+            $Result.InstallStatus = "Failed"
+            $Result.Error = "No CAB file matched pattern."
+            return $Result
+        }
+
+        $RemoteCabPath = "C:\\Update\\MSU\\$MSUName\\$CabFile"
+
+        if (-not (Test-Path "\\$Computer\c$\Update\MSU\$MSUName\$CabFile")) {
+            $Result.InstallStatus = "Failed"
+            $Result.Error = "CAB path not found on remote machine."
+            return $Result
+        }
+
+        Write-Host "[$Computer] Executing DISM install command on: $RemoteCabPath"
+
+        $job = Start-Job {
+            Invoke-Command -ComputerName $using:Computer -ScriptBlock {
+                param($CabPath)
+                $p = Start-Process -FilePath dism.exe -ArgumentList "/online", "/add-package", "/packagepath:`"$CabPath`"", "/quiet", "/norestart" -Wait -PassThru -Verb RunAs
+                return $p.ExitCode
+            } -ArgumentList $using:RemoteCabPath -ErrorAction Stop
+        }
+
+        if (Wait-Job $job -Timeout $TimeoutSeconds) {
+            $ExitCode = Receive-Job $job
+            $Result.ExitCode = $ExitCode
+            $Result.ExitDescription = if ($ExitCodeMap.ContainsKey($ExitCode)) { $ExitCodeMap[$ExitCode] } else { "Unknown" }
+            $Result.InstallStatus = if ($ExitCode -eq 0 -or $ExitCode -eq 3010) { "Success" } else { "Failed" }
+        } else {
+            Stop-Job $job | Out-Null
+            $Result.InstallStatus = "Failed"
+            $Result.Error = "DISM install timed out after $TimeoutSeconds seconds."
+        }
+    }
+    catch {
+        $Result.InstallStatus = "Failed"
+        $Result.Error = $_.Exception.Message
+    }
+
+    return $Result
+}
+
+# Function to find appropriate .cab file
+function Find-CabFile {
+    param ([string]$FolderPath)
+    $patterns = @("Windows*-KB*-x*.cab", "SSU-*.cab")
+    foreach ($pattern in $patterns) {
+        $cab = Get-ChildItem -Path $FolderPath -Filter $pattern -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($cab) { return $cab.Name }
+    }
+    return $null
+}
